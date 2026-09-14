@@ -1,6 +1,6 @@
 {
   "name": "tauri-plugin-webproxy-api",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "author": "mantou132",
   "description": "JavaScript API for tauri-plugin-webproxy",
   "type": "module",

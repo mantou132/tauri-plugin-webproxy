@@ -9,7 +9,8 @@ Tauri 插件：提供 `webproxy://` 自定义协议，支持在 WebView 中安�
 - **移动端与全平台支持**:
   - macOS / iOS / Linux: 使用原生自定义协议 `webproxy://`
   - Android / Windows: 兼容 Wry 的 HTTP/HTTPS workaround (`http(s)://webproxy.<host>/...`)
-- **注入状态桥接脚本**: 自动在代理页面注入轻量级 state bridge，拦截 iframe 内部的导航、`window.open` 及标题变动，并通过 `postMessage` 向宿主应用同步。
+- **自动代理动态请求**: 自动拦截代理页面内的 `fetch` 与 `XMLHttpRequest`，将绝对路径的 HTTPS 请求重定向至 webproxy，彻底解决页面内 API 的 CORS 跨域及 Cookie 丢失问题。
+- **注入状态桥接脚本**: 自动在代理页面注入轻量级 state bridge，拦截 iframe 内部的导航、`window.open` 及标题变动，并通过 `postMessage` 向宿主应用同步原始真实目标 URL。
 - **Cookie 保持**: 原生 Rust HTTP 客户端自带 cookie store，保持目标站点的登录/状态会话。
 
 ## 安装
@@ -54,19 +55,12 @@ const iframe = document.createElement('iframe')
 iframe.src = proxiedUrl
 document.body.appendChild(iframe)
 
-// 监听 iframe 内部状态及导航变化
+// 监听 iframe 内部状态及导航变化（state.url 为真实原始 URL，无需额外解码）
 const stopListening = onWebProxyState((state) => {
   console.log('Target URL:', state.url)
   console.log('Page Title:', state.title)
   console.log('Navigation Target:', state.target)
 })
-```
-
-### 也支持 `fetch` 请求
-
-```typescript
-const response = await fetch(toWebproxyUrl('https://api.example.com/data'))
-const data = await response.json()
 ```
 
 ## 许可证

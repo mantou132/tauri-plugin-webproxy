@@ -17,6 +17,10 @@ export interface WebProxyNextStateMessage {
   state: WebProxyState
 }
 
+export const WEBPROXY_SCHEME = 'webproxy'
+export const WEBPROXY_PROTOCOL = `${WEBPROXY_SCHEME}:`
+export const WEBPROXY_HOST_PREFIX = `${WEBPROXY_SCHEME}.`
+
 /**
  * Converts an HTTPS URL into the host-preserving `webproxy` URL understood by
  * the native protocol handler.
@@ -40,27 +44,27 @@ export function toWebproxyUrl(url: string): string {
   }
 
   const suffix = `${target.pathname}${target.search}${target.hash}`
-  const probe = new URL(convertFileSrc('', 'webproxy'))
+  const probe = new URL(convertFileSrc('', WEBPROXY_SCHEME))
 
   // macOS / iOS / Linux register the real custom scheme.
-  if (probe.protocol === 'webproxy:') {
-    return `webproxy://${target.host}${suffix}`
+  if (probe.protocol === WEBPROXY_PROTOCOL) {
+    return `${WEBPROXY_PROTOCOL}//${target.host}${suffix}`
   }
 
   // Android / Windows use Wry's http(s) custom-protocol workaround:
   // webproxy://example.com/a <-> http(s)://webproxy.example.com/a
-  return `${probe.protocol}//webproxy.${target.host}${suffix}`
+  return `${probe.protocol}//${WEBPROXY_HOST_PREFIX}${target.host}${suffix}`
 }
 
 /**
  * Listens for navigation and state change events posted by the proxied page/iframe.
  * Returns an unsubscribe function to remove the listener.
  */
-export function onWebProxyState(listener: (state: WebProxyState) => void): () => void {
+export function onWebProxyState(source: Window | null, listener: (state: WebProxyState) => void): () => void {
   const eventListener = (event: MessageEvent) => {
-    if (event.data && typeof event.data === 'object' && event.data.type === 'next_state' && event.data.state) {
-      listener(event.data.state as WebProxyState)
-    }
+    if (source && source !== event.source) return;
+    if (event.data?.type !== 'next_state' || !event.data?.state) return
+    listener(event.data.state as WebProxyState)
   }
 
   window.addEventListener('message', eventListener)

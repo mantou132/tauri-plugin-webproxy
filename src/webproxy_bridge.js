@@ -7,15 +7,19 @@
     writable: false,
   });
 
+  const WEBPROXY_SCHEME = "webproxy";
+  const WEBPROXY_PROTOCOL = `${WEBPROXY_SCHEME}:`;
+  const WEBPROXY_HOST_PREFIX = `${WEBPROXY_SCHEME}.`;
+
   const toWebproxyUrl = (value) => {
     try {
       const url = new URL(value, document.baseURI);
       if (url.protocol === "https:") {
-        if (location.protocol === "webproxy:") {
-          return `webproxy://${url.host}${url.pathname}${url.search}${url.hash}`;
+        if (location.protocol === WEBPROXY_PROTOCOL) {
+          return `${WEBPROXY_PROTOCOL}//${url.host}${url.pathname}${url.search}${url.hash}`;
         }
-        if (location.host.startsWith("webproxy.")) {
-          return `${location.protocol}//webproxy.${url.host}${url.pathname}${url.search}${url.hash}`;
+        if (location.host.startsWith(WEBPROXY_HOST_PREFIX)) {
+          return `${location.protocol}//${WEBPROXY_HOST_PREFIX}${url.host}${url.pathname}${url.search}${url.hash}`;
         }
       }
       return url.href;
@@ -47,7 +51,37 @@
     }
   };
 
-  window.open = function (url, target) {
+  // Proxy fetch requests to route through webproxy
+  const originalFetch = window.fetch;
+  window.fetch = function (input, init) {
+    try {
+      if (typeof input === "string" || input instanceof URL) {
+        return originalFetch.call(this, toWebproxyUrl(input), init);
+      }
+      if (input instanceof Request) {
+        const proxiedUrl = toWebproxyUrl(input.url);
+        if (proxiedUrl !== input.url) {
+          return originalFetch.call(this, new Request(proxiedUrl, input), init);
+        }
+      }
+    } catch {
+      // Fallback to original fetch
+    }
+    return originalFetch.call(this, input, init);
+  };
+
+  // Proxy XMLHttpRequest to route through webproxy
+  const originalOpen = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function (method, url, ...rest) {
+    try {
+      url = toWebproxyUrl(url);
+    } catch {
+      // Fallback
+    }
+    return originalOpen.call(this, method, url, ...rest);
+  };
+
+  window.open = (url, target) => {
     const normalizedTarget = !target || target === "_self" ? "" : "_blank";
     postState(resolveUrl(url == null ? "about:blank" : String(url)), normalizedTarget);
     return null;
