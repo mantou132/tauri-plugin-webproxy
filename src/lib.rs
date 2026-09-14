@@ -20,6 +20,7 @@ fn client() -> &'static reqwest::Client {
       // Keep upstream HTTP cookies in the native client. Cookies belonging to
       // the custom WebView origin are intentionally not forwarded upstream.
       .cookie_store(true)
+      .gzip(true)
       .build()
       .expect("failed to build webproxy HTTP client")
   })
@@ -176,12 +177,9 @@ async fn forward(target: Url, request: Request<Vec<u8>>) -> Response<Vec<u8>> {
     );
   }
 
-  // HTML may be rewritten below, so ask the server for identity encoding.
-  // This also avoids passing a compressed body through a custom-protocol layer
-  // that may need to alter security metadata.
-  upstream = upstream.header("accept-encoding", "identity").body(body);
-
-  let upstream = match upstream.send().await {
+  // The native client transparently negotiates and decodes gzip from upstream,
+  // reducing network transfer while presenting decoded plain bytes for HTML rewriting.
+  let upstream = match upstream.body(body).send().await {
     Ok(response) => response,
     Err(error) => {
       return error_response(
@@ -262,7 +260,7 @@ fn should_strip_response_header(name: &str, body_changed: bool) -> bool {
   HOP_BY_HOP_HEADERS.contains(&name)
     || RESPONSE_POLICY_HEADERS.contains(&name)
     || name.starts_with("access-control-")
-    || matches!(name, "content-length" | "set-cookie")
+    || matches!(name, "content-length" | "set-cookie" | "content-encoding")
     || (body_changed && matches!(name, "etag" | "content-md5" | "digest"))
 }
 
@@ -533,5 +531,63 @@ mod tests {
       !STATE_BRIDGE_SCRIPT.to_ascii_lowercase().contains("</script"),
       "webproxy_bridge.js must not contain a literal </script"
     );
+  }
+
+  #[test]
+  fn transparently_decodes_gzip_and_injects_bridge() {
+    tauri::async_runtime::block_on(async {
+      use std::io::{Read, Write};
+      let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+      let addr = listener.local_addr().unwrap();
+
+      let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 2048];
+        let n = stream.read(&mut buf).unwrap();
+        let req_str = String::from_utf8_lossy(&buf[..n]);
+        assert!(
+          req_str.to_ascii_lowercase().contains("accept-encoding"),
+          "request should advertise compression support"
+        );
+
+        // Gzipped "<!doctype html><html><head><title>Test</title></head><body>ok</body></html>"
+        let gz_body: &[u8] = &[
+          31, 139, 8, 0, 0, 0, 0, 0, 2, 255, 179, 81, 76, 201, 79, 46, 169, 44, 72, 85, 200, 40,
+          201, 205, 177, 179, 129, 146, 169, 137, 41, 118, 54, 37, 153, 37, 57, 169, 118, 33, 169,
+          197, 37, 54, 250, 16, 182, 141, 62, 68, 38, 41, 63, 165, 210, 46, 63, 219, 70, 31, 204,
+          0, 138, 130, 116, 1, 0, 148, 231, 186, 58, 75, 0, 0, 0,
+        ];
+
+        let response = format!(
+          "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+          gz_body.len()
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+        stream.write_all(&gz_body).unwrap();
+      });
+
+      let target_url = Url::parse(&format!("http://{addr}/test.html")).unwrap();
+      let req = Request::builder()
+        .method("GET")
+        .uri(format!("webproxy://{addr}/test.html"))
+        .body(Vec::new())
+        .unwrap();
+
+      let resp = forward(target_url, req).await;
+      server.join().unwrap();
+
+      assert_eq!(resp.status(), 200);
+      assert!(
+        !resp.headers().contains_key("content-encoding"),
+        "response to webview must not retain content-encoding"
+      );
+
+      let body_str = String::from_utf8(resp.into_body()).unwrap();
+      assert!(
+        body_str.contains("data-webproxy-state-bridge"),
+        "bridge script should be injected into gzipped html"
+      );
+      assert!(body_str.contains("<title>Test</title>"));
+    });
   }
 }
