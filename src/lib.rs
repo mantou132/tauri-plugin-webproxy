@@ -1,28 +1,35 @@
 use std::sync::OnceLock;
 
 use reqwest::Url;
+use reqwest_middleware::ClientWithMiddleware;
 use tauri::{
   http::{Request, Response, StatusCode},
   plugin::{Builder, TauriPlugin},
-  Runtime, UriSchemeContext, UriSchemeResponder,
+  Manager, Runtime, UriSchemeContext, UriSchemeResponder,
 };
 
+mod cache;
 mod error;
+pub use cache::{CacheConfig, CacheMode};
 pub use error::{Error, Result};
 
 pub const WEBPROXY_SCHEME: &str = "webproxy";
 
-static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+static CACHE_CONFIG: OnceLock<CacheConfig> = OnceLock::new();
+static CLIENT: OnceLock<ClientWithMiddleware> = OnceLock::new();
 
-fn client() -> &'static reqwest::Client {
+/// Configures the cache before the webproxy client is initialized.
+///
+/// Returns `Ok(())` if configuration was set, or `Err(config)` if the client
+/// has already been initialized.
+pub fn configure_cache(config: CacheConfig) -> std::result::Result<(), CacheConfig> {
+  CACHE_CONFIG.set(config)
+}
+
+fn client() -> &'static ClientWithMiddleware {
   CLIENT.get_or_init(|| {
-    reqwest::Client::builder()
-      // Keep upstream HTTP cookies in the native client. Cookies belonging to
-      // the custom WebView origin are intentionally not forwarded upstream.
-      .cookie_store(true)
-      .gzip(true)
-      .build()
-      .expect("failed to build webproxy HTTP client")
+    let config = CACHE_CONFIG.get().cloned().unwrap_or_default();
+    cache::build_cached_client(&config)
   })
 }
 
@@ -51,9 +58,29 @@ const RESPONSE_POLICY_HEADERS: &[&str] = &[
   "clear-site-data",
 ];
 
-/// Registers the webproxy custom protocol and navigation filter on a plugin builder.
+/// Registers the webproxy custom protocol and navigation filter on a plugin builder
+/// with default cache configuration.
 pub fn register<R: Runtime>(builder: Builder<R>) -> Builder<R> {
+  register_with_config(builder, CacheConfig::default())
+}
+
+/// Registers the webproxy custom protocol and navigation filter on a plugin builder
+/// with custom cache configuration.
+pub fn register_with_config<R: Runtime>(
+  builder: Builder<R>,
+  config: CacheConfig,
+) -> Builder<R> {
   builder
+    .setup(move |app, _api| {
+      let mut cfg = config.clone();
+      if cfg.cache_dir.is_none() {
+        if let Ok(app_cache) = app.path().app_cache_dir() {
+          cfg.cache_dir = Some(app_cache.join("tauri-plugin-webproxy-cache"));
+        }
+      }
+      let _ = CACHE_CONFIG.set(cfg);
+      Ok(())
+    })
     .register_asynchronous_uri_scheme_protocol(WEBPROXY_SCHEME, scheme_handler())
     .on_navigation(|_webview, url| {
       let scheme = url.scheme();
@@ -67,6 +94,11 @@ pub fn register<R: Runtime>(builder: Builder<R>) -> Builder<R> {
 /// Initializes the webproxy plugin.
 pub fn init<R: Runtime>() -> TauriPlugin<R> {
   register(Builder::new("webproxy")).build()
+}
+
+/// Initializes the webproxy plugin with custom cache configuration.
+pub fn init_with_config<R: Runtime>(config: CacheConfig) -> TauriPlugin<R> {
+  register_with_config(Builder::new("webproxy"), config).build()
 }
 
 pub fn scheme_handler<R: Runtime>(
@@ -559,7 +591,13 @@ mod tests {
         ];
 
         let response = format!(
-          "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+          "HTTP/1.1 200 OK\r
+Content-Type: text/html; charset=utf-8\r
+Content-Encoding: gzip\r
+Content-Length: {}\r
+Connection: close\r
+\r
+",
           gz_body.len()
         );
         stream.write_all(response.as_bytes()).unwrap();
@@ -588,6 +626,71 @@ mod tests {
         "bridge script should be injected into gzipped html"
       );
       assert!(body_str.contains("<title>Test</title>"));
+    });
+  }
+
+  #[test]
+  fn caches_responses_with_cache_control() {
+    tauri::async_runtime::block_on(async {
+      use std::io::{Read, Write};
+      use std::sync::atomic::{AtomicUsize, Ordering};
+      use std::sync::Arc;
+
+      let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+      let addr = listener.local_addr().unwrap();
+
+      let hit_count = Arc::new(AtomicUsize::new(0));
+      let hit_count_clone = hit_count.clone();
+
+      let server = std::thread::spawn(move || {
+        // We only expect 1 request from upstream; the 2nd must hit the cache!
+        for stream in listener.incoming().take(1) {
+          let mut stream = stream.unwrap();
+          let mut buf = [0u8; 1024];
+          let _ = stream.read(&mut buf).unwrap();
+          hit_count_clone.fetch_add(1, Ordering::SeqCst);
+
+          let body = "console.log('cached asset');";
+          let response = format!(
+            "HTTP/1.1 200 OK\r
+Content-Type: application/javascript\r
+Cache-Control: public, max-age=3600\r
+Content-Length: {}\r
+Connection: close\r
+\r
+{}",
+            body.len(),
+            body
+          );
+          stream.write_all(response.as_bytes()).unwrap();
+        }
+      });
+
+      let target_url = Url::parse(&format!("http://{addr}/asset.js")).unwrap();
+      let req1 = Request::builder()
+        .method("GET")
+        .uri(format!("webproxy://{addr}/asset.js"))
+        .body(Vec::new())
+        .unwrap();
+
+      let resp1 = forward(target_url.clone(), req1).await;
+      assert_eq!(resp1.status(), 200);
+      assert_eq!(resp1.into_body(), b"console.log('cached asset');");
+
+      // Second request: mock server has closed the listener loop,
+      // so if a network request were made it would fail. It must hit cache!
+      let req2 = Request::builder()
+        .method("GET")
+        .uri(format!("webproxy://{addr}/asset.js"))
+        .body(Vec::new())
+        .unwrap();
+
+      let resp2 = forward(target_url, req2).await;
+      assert_eq!(resp2.status(), 200);
+      assert_eq!(resp2.into_body(), b"console.log('cached asset');");
+
+      server.join().unwrap();
+      assert_eq!(hit_count.load(Ordering::SeqCst), 1);
     });
   }
 }

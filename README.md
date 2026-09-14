@@ -5,6 +5,7 @@ Tauri 插件：提供 `webproxy://` 自定义协议，支持在 WebView 中安�
 ## 特性
 
 - **绕过限制**: 自动移除 Content-Security-Policy (CSP) 与 X-Frame-Options 限制，使被限制的网页可在 iframe 中正常嵌入加载。
+- **HTTP 磁盘缓存中间件**: 内置遵循 RFC 9111 标准的 HTTP 缓存中间件（基于 `http-cache-reqwest`），弥补 WebView 自定义协议无法享受原生 Disk Cache 的缺陷；静态资源在 `Cache-Control: max-age` 有效期内直接命中本地磁盘缓存，支持条件请求（ETag / 304 Not Modified）自动 revalidate，大幅降低加载耗时与网络带宽。
 - **保持原始路径与来源**: 自定义协议映射原始主机与路径，相对资源和跨域行为自然处理。
 - **移动端与全平台支持**:
   - macOS / iOS / Linux: 使用原生自定义协议 `webproxy://`
@@ -24,10 +25,31 @@ tauri-plugin-webproxy = { path = "../tauri-plugin-webproxy" }
 
 ### 2. 注册插件 (`src-tauri/src/lib.rs`)
 
+默认配置（自动使用应用的 cache 目录存放 HTTP 磁盘缓存）：
+
 ```rust
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_webproxy::init())
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}
+```
+
+自定义缓存配置（可选）：
+
+```rust
+use tauri_plugin_webproxy::{CacheConfig, CacheMode};
+
+pub fn run() {
+    let cache_config = CacheConfig::new()
+        .enabled(true)
+        // 可自定义缓存目录，若不指定则自动保存在 AppCacheDir 下
+        // .cache_dir("/custom/cache/dir")
+        .cache_mode(CacheMode::Default);
+
+    tauri::Builder::default()
+        .plugin(tauri_plugin_webproxy::init_with_config(cache_config))
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
