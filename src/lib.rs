@@ -320,12 +320,90 @@ fn preflight_response(request: &Request<Vec<u8>>) -> Response<Vec<u8>> {
     .unwrap()
 }
 
+fn escape_html(input: &str) -> String {
+  input
+    .replace('&', "&amp;")
+    .replace('<', "&lt;")
+    .replace('>', "&gt;")
+    .replace('\"', "&quot;")
+}
+
 fn error_response(status: StatusCode, message: &str) -> Response<Vec<u8>> {
+  let status_code = status.as_u16();
+  let reason = status.canonical_reason().unwrap_or("Error");
+  let escaped_message = escape_html(message);
+
+  let html = format!(
+    r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{status_code} {reason}</title>
+  <style>
+    body {{
+      font-family: system-ui, -apple-system, sans-serif;
+      margin: 0;
+      padding: max(40px, 12vh) 24px 24px;
+      display: flex;
+      justify-content: center;
+      align-items: flex-start;
+      min-height: 100vh;
+      box-sizing: border-box;
+      background: #f8fafc;
+      color: #1e293b;
+    }}
+    @media (prefers-color-scheme: dark) {{
+      body {{ background: #0f172a; color: #f8fafc; }}
+      .card {{ background: #1e293b !important; border-color: #334155 !important; }}
+      pre {{ background: #0f172a !important; color: #94a3b8 !important; }}
+      button {{ background: #334155 !important; color: #f8fafc !important; }}
+    }}
+    .card {{
+      max-width: 480px;
+      width: 100%;
+      background: #fff;
+      border: 1px solid #e2e8f0;
+      border-radius: 8px;
+      padding: 24px;
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+    }}
+    h1 {{ font-size: 1.25rem; margin: 0 0 12px; }}
+    pre {{
+      background: #f1f5f9;
+      padding: 12px;
+      border-radius: 6px;
+      font-size: 0.8125rem;
+      white-space: pre-wrap;
+      word-break: break-all;
+      margin: 0 0 16px;
+    }}
+    button {{
+      padding: 8px 16px;
+      border: 0;
+      border-radius: 6px;
+      background: #e2e8f0;
+      color: #1e293b;
+      cursor: pointer;
+      font-size: 0.875rem;
+    }}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>{status_code} {reason}</h1>
+    <pre>{escaped_message}</pre>
+    <button onclick="location.reload()">Reload</button>
+  </div>
+</body>
+</html>"#
+  );
+
   Response::builder()
     .status(status)
-    .header("content-type", "text/plain; charset=utf-8")
+    .header("content-type", "text/html; charset=utf-8")
     .header("access-control-allow-origin", "*")
-    .body(message.as_bytes().to_vec())
+    .body(html.into_bytes())
     .unwrap()
 }
 
@@ -566,6 +644,26 @@ mod tests {
   }
 
   #[test]
+  fn generates_styled_error_page() {
+    let resp = error_response(
+      StatusCode::BAD_GATEWAY,
+      "webproxy upstream request failed: connection refused <test>",
+    );
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+      resp.headers().get("content-type").unwrap(),
+      "text/html; charset=utf-8"
+    );
+    assert_eq!(resp.headers().get("access-control-allow-origin").unwrap(), "*");
+
+    let body = String::from_utf8(resp.into_body()).unwrap();
+    assert!(body.contains("502 Bad Gateway"));
+    assert!(body.contains("connection refused &lt;test&gt;"));
+    assert!(!body.contains("<test>"));
+    assert!(body.contains("location.reload()"));
+  }
+
+  #[test]
   fn transparently_decodes_gzip_and_injects_bridge() {
     tauri::async_runtime::block_on(async {
       use std::io::{Read, Write};
@@ -591,13 +689,7 @@ mod tests {
         ];
 
         let response = format!(
-          "HTTP/1.1 200 OK\r
-Content-Type: text/html; charset=utf-8\r
-Content-Encoding: gzip\r
-Content-Length: {}\r
-Connection: close\r
-\r
-",
+          "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
           gz_body.len()
         );
         stream.write_all(response.as_bytes()).unwrap();
@@ -652,13 +744,7 @@ Connection: close\r
 
           let body = "console.log('cached asset');";
           let response = format!(
-            "HTTP/1.1 200 OK\r
-Content-Type: application/javascript\r
-Cache-Control: public, max-age=3600\r
-Content-Length: {}\r
-Connection: close\r
-\r
-{}",
+            "HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nCache-Control: public, max-age=3600\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             body.len(),
             body
           );
