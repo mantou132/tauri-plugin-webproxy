@@ -18,9 +18,24 @@
         if (location.protocol === WEBPROXY_PROTOCOL) {
           return `${WEBPROXY_PROTOCOL}//${url.host}${url.pathname}${url.search}${url.hash}`;
         }
-        if (location.host.startsWith(WEBPROXY_HOST_PREFIX)) {
+        if (location.host.startsWith(WEBPROXY_HOST_PREFIX) && !url.host.startsWith(WEBPROXY_HOST_PREFIX)) {
           return `${location.protocol}//${WEBPROXY_HOST_PREFIX}${url.host}${url.pathname}${url.search}${url.hash}`;
         }
+      }
+      return url.href;
+    } catch {
+      return String(value);
+    }
+  };
+
+  const toOriginalUrl = (value) => {
+    try {
+      const url = new URL(value, document.baseURI);
+      if (url.protocol === WEBPROXY_PROTOCOL) {
+        return `https://${url.host}${url.pathname}${url.search}${url.hash}`;
+      }
+      if (url.host.startsWith(WEBPROXY_HOST_PREFIX)) {
+        return `https://${url.host.slice(WEBPROXY_HOST_PREFIX.length)}${url.pathname}${url.search}${url.hash}`;
       }
       return url.href;
     } catch {
@@ -34,7 +49,7 @@
       {
         type: "next_state",
         state: {
-          url: toWebproxyUrl(url),
+          url: toOriginalUrl(url),
           title: document.title,
           target,
         },
@@ -43,31 +58,24 @@
     );
   };
 
-  const resolveUrl = (value) => {
-    try {
-      return new URL(value, document.baseURI).href;
-    } catch {
-      return String(value);
-    }
-  };
-
   // Proxy fetch requests to route through webproxy
   const originalFetch = window.fetch;
   window.fetch = function (input, init) {
+    const ctx = this || window;
     try {
       if (typeof input === "string" || input instanceof URL) {
-        return originalFetch.call(this, toWebproxyUrl(input), init);
+        return originalFetch.call(ctx, toWebproxyUrl(input), init);
       }
       if (input instanceof Request) {
         const proxiedUrl = toWebproxyUrl(input.url);
         if (proxiedUrl !== input.url) {
-          return originalFetch.call(this, new Request(proxiedUrl, input), init);
+          return originalFetch.call(ctx, new Request(proxiedUrl, init ? new Request(input, init) : input));
         }
       }
     } catch {
       // Fallback to original fetch
     }
-    return originalFetch.call(this, input, init);
+    return originalFetch.call(ctx, input, init);
   };
 
   // Proxy XMLHttpRequest to route through webproxy
@@ -83,7 +91,7 @@
 
   window.open = (url, target) => {
     const normalizedTarget = !target || target === "_self" ? "" : "_blank";
-    postState(resolveUrl(url == null ? "about:blank" : String(url)), normalizedTarget);
+    postState(new URL(url == null ? "about:blank" : url, document.baseURI).href, normalizedTarget);
     return null;
   };
 
@@ -91,22 +99,39 @@
     "click",
     (event) => {
       const path = typeof event.composedPath === "function" ? event.composedPath() : [];
-      const anchor =
-        path.find(
-          (node) =>
-            node instanceof HTMLAnchorElement &&
-            node.hasAttribute("href"),
-        ) ||
-        (event.target instanceof Element
-          ? event.target.closest('a[href]')
-          : null);
+      let anchor = null;
+
+      for (const node of path) {
+        if (node instanceof Element && node.tagName.toLowerCase() === "a" && node.hasAttribute("href")) {
+          anchor = node;
+          break;
+        }
+      }
+      if (!anchor && event.target instanceof Element) {
+        anchor = event.target.closest("a[href]");
+      }
 
       if (!anchor) return;
-      if (anchor.href.startsWith("#")) return;
 
-      const target = !anchor.target || anchor.target === "_self" ? "" : "_blank";
+      const rawHref = anchor.getAttribute("href");
+      if (!rawHref || rawHref.startsWith("#") || rawHref.startsWith("javascript:")) {
+        return;
+      }
+
+      if (anchor.hasAttribute("download")) return;
+
+      let fullHref = "";
+      try {
+        fullHref = new URL(rawHref, document.baseURI).href;
+      } catch {
+        return;
+      }
+
+      const target = anchor.getAttribute("target") || "";
+      const isBlank = target === "_blank";
+
+      postState(fullHref, isBlank ? "_blank" : "");
       event.preventDefault();
-      postState(anchor.href, target);
     },
     true,
   );
