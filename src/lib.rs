@@ -82,13 +82,6 @@ pub fn register_with_config<R: Runtime>(
       Ok(())
     })
     .register_asynchronous_uri_scheme_protocol(WEBPROXY_SCHEME, scheme_handler())
-    .on_navigation(|_webview, url| {
-      let scheme = url.scheme();
-      matches!(
-        scheme,
-        "http" | "https" | "webproxy" | "tauri" | "asset" | "about" | "blob" | "data"
-      )
-    })
 }
 
 /// Initializes the webproxy plugin.
